@@ -1,21 +1,27 @@
-"""Sophimatics — reference implementation for The Sovereign Prosthesis (IACAP 2026)."""
+"""
+Sophimatics: The Operating Philosophy for Cognitive Extension
 
+This module implements the Sophimatic framework from "The Sovereign Prosthesis"
+for two-dimensional temporal weighting of RAG memory retrieval.
+
+Core Principles:
+1. Two-Dimensional Temporality: Chronological time vs. experiential significance
+2. Russellian Operating System: Weighted toward intelligent dissent
+3. Persistent State-Awareness: Track projects, logical vacancies, ongoing threads
+4. Ur-Codex Governance: Longitudinal conversational history as world-historical context
+5. Provenance Marking: Memory vs. inference vs. speculation
+"""
+
+from .temporal_weighting import TemporalWeightingEngine
 from .ur_codex import UrCodexManager
-from .temporal_weighting import TemporalWeightingEngine, TemporalScore
-from .russellian_os import RussellianOS, DissentLevel
+from .russellian_os import RussellianOS
+from .provenance import ProvenanceTracker
 from .state_awareness import StateAwarenessEngine
-from .wiki_integration import WikiSophimaticsEngine
 
 __all__ = [
-    "UrCodexManager",
-    "TemporalWeightingEngine",
-    "TemporalScore",
-    "RussellianOS",
-    "DissentLevel",
-    "StateAwarenessEngine",
-    "WikiSophimaticsEngine",
+    'TemporalWeightingEngine',
+    'UrCodexManager',
+    'RussellianOS',
+    'ProvenanceTracker',
+    'StateAwarenessEngine'
 ]
-
-__version__ = "0.1.0"
-__author__ = "Michael Bouchard, Pauper King LLC"
-__license__ = "CC BY 4.0"

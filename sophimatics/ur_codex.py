@@ -1,146 +1,435 @@
-"""UrCodexManager — longitudinal corpus management via ChromaDB.
+"""
+Ur-Codex Manager: Longitudinal Memory Governance
 
-Implements the Ur-Codex described in Section 2 of The Sovereign Prosthesis.
-The Ur-Codex is the persistent, user-specific corpus whose accumulation
-across interactions crosses the prosthesis threshold (Clark & Chalmers).
+The Ur-Codex is the complete conversational history that serves as
+"world-historical context" for the cognitive prosthesis.
+
+From "The Sovereign Prosthesis":
+"The Ur-Codex—the longitudinal record of exchanges across years—
+serves as a kind of world-historical context."
+
+This module handles:
+1. Ingesting the Complete Corpus (transfer packets, psychological profiles, creative work)
+2. Maintaining the importance index for experiential weighting
+3. Providing contextual retrieval that respects the full history
 """
 
-from __future__ import annotations
-
+import os
+import json
 import hashlib
-import uuid
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any
-
-try:
-    import chromadb
-    from chromadb.config import Settings
-    _CHROMA_AVAILABLE = True
-except ImportError:
-    _CHROMA_AVAILABLE = False
+import chromadb
 
 
 @dataclass
-class CodexEntry:
+class CorpusDocument:
+    """A document in the Ur-Codex."""
+    id: str
     content: str
-    source: str
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    metadata: dict[str, Any] = field(default_factory=dict)
-    entry_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-
-    def content_hash(self) -> str:
-        return hashlib.sha256(self.content.encode()).hexdigest()[:16]
-
-
-@dataclass
-class RetrievalResult:
-    entry_id: str
-    content: str
-    source: str
-    distance: float
-    metadata: dict[str, Any]
+    source_file: str
+    doc_type: str  # 'transfer_packet', 'psychological', 'creative', 'conversation'
+    importance_score: float  # 0-10
+    date: Optional[datetime]
+    topics: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class UrCodexManager:
-    """Manages the user's longitudinal corpus — the Ur-Codex.
+    """
+    Manages the Ur-Codex: the longitudinal conversational memory.
 
-    The Ur-Codex is not a session cache. It is the accumulated record of a
-    user's intellectual history: conversations, documents, reflections, and
-    projects. Its persistence across time is what enables proximal integration
-    and distinguishes AII from stateless cloud AI.
+    The Ur-Codex is more than a database—it's the substrate of
+    persistent state-awareness that makes the prosthesis continuous.
+
+    Key responsibilities:
+    1. Ingest and index the Complete Corpus
+    2. Maintain importance scores for Sophimatic weighting
+    3. Track document provenance (source, date, type)
+    4. Provide retrieval interface for the weighting engine
     """
 
-    COLLECTION_NAME = "ur_codex"
-    DEFAULT_CHUNK_SIZE = 512
-    DEFAULT_CHUNK_OVERLAP = 64
-
-    def __init__(self, persist_directory: str = "./codex_store") -> None:
+    def __init__(
+        self,
+        persist_directory: str = "./chroma_db",
+        collection_name: str = "ur_codex",
+        corpus_path: Optional[str] = None
+    ):
         self.persist_directory = persist_directory
-        self._collection = None
-        self._client = None
+        self.collection_name = collection_name
+        self.corpus_path = corpus_path
 
-        if not _CHROMA_AVAILABLE:
-            raise ImportError(
-                "chromadb is required: pip install chromadb"
+        # Initialize ChromaDB
+        self.client = chromadb.PersistentClient(path=persist_directory)
+
+        # Get or create collection (uses default embedding function)
+        self.collection = self.client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+
+        # Cache for importance index
+        self._importance_index: Dict[str, float] = {}
+
+    def _generate_doc_id(self, content: str, source: str) -> str:
+        """Generate stable document ID from content hash."""
+        hash_input = f"{source}:{content[:500]}"
+        return hashlib.sha256(hash_input.encode()).hexdigest()[:16]
+
+    def load_importance_index(self, index_path: str) -> Dict[str, float]:
+        """
+        Load the importance index from the parsed transfer packets.
+
+        The importance index maps document identifiers to their
+        experiential significance scores (0-10).
+        """
+        importance_map = {}
+
+        try:
+            with open(index_path, 'r') as f:
+                content = f.read()
+
+            current_score = 0
+            for line in content.split('\n'):
+                line = line.strip()
+
+                # Parse score headers
+                if line.startswith('## Importance Score:'):
+                    try:
+                        score_str = line.replace('## Importance Score:', '').replace('/10', '').strip()
+                        current_score = int(score_str)
+                    except ValueError:
+                        pass
+
+                # Parse packet references
+                elif line.startswith('- **['):
+                    # Extract packet name
+                    start = line.find('[') + 1
+                    end = line.find(']')
+                    if start > 0 and end > start:
+                        packet_name = line[start:end]
+                        importance_map[packet_name] = current_score
+
+        except FileNotFoundError:
+            pass
+
+        self._importance_index = importance_map
+        return importance_map
+
+    def get_importance_score(self, doc_title: str, default: float = 5.0) -> float:
+        """Look up importance score for a document."""
+        # Try exact match
+        if doc_title in self._importance_index:
+            return float(self._importance_index[doc_title])
+
+        # Try partial match
+        for key, score in self._importance_index.items():
+            if key in doc_title or doc_title in key:
+                return float(score)
+
+        return default
+
+    def ingest_transfer_packets(self, packets_dir: str) -> int:
+        """
+        Ingest all transfer packets from the parsed corpus.
+
+        Each packet becomes a document in the Ur-Codex with its
+        importance score from the index.
+        """
+        packets_path = Path(packets_dir) / "packets"
+        if not packets_path.exists():
+            return 0
+
+        # Load importance index
+        index_path = Path(packets_dir) / "04_IMPORTANCE_INDEX.md"
+        if index_path.exists():
+            self.load_importance_index(str(index_path))
+
+        ingested = 0
+        for packet_file in packets_path.glob("*.md"):
+            with open(packet_file, 'r') as f:
+                content = f.read()
+
+            # Extract title from first line
+            lines = content.split('\n')
+            title = lines[0].strip('#').strip() if lines else packet_file.stem
+
+            # Get importance score
+            importance = self.get_importance_score(title)
+
+            # Create document
+            doc_id = self._generate_doc_id(content, str(packet_file))
+
+            # Add to collection
+            self.collection.upsert(
+                ids=[doc_id],
+                documents=[content],
+                metadatas=[{
+                    "source_file": str(packet_file),
+                    "doc_type": "transfer_packet",
+                    "title": title,
+                    "importance_score": importance,
+                    "ingested_at": datetime.now().isoformat()
+                }]
             )
+            ingested += 1
 
-        self._client = chromadb.PersistentClient(
-            path=persist_directory,
-            settings=Settings(anonymized_telemetry=False),
+        return ingested
+
+    def ingest_psychological_profiles(self, profiles_dir: str) -> int:
+        """
+        Ingest psychological assessment documents.
+
+        These are high-importance documents that define the cognitive
+        fingerprint and should be weighted accordingly.
+        """
+        profiles_path = Path(profiles_dir)
+        if not profiles_path.exists():
+            return 0
+
+        ingested = 0
+        for profile_file in profiles_path.glob("*.md"):
+            with open(profile_file, 'r') as f:
+                content = f.read()
+
+            title = profile_file.stem
+            doc_id = self._generate_doc_id(content, str(profile_file))
+
+            # Psychological profiles are inherently high-importance (8-10)
+            importance = 9.0
+
+            self.collection.upsert(
+                ids=[doc_id],
+                documents=[content],
+                metadatas=[{
+                    "source_file": str(profile_file),
+                    "doc_type": "psychological",
+                    "title": title,
+                    "importance_score": importance,
+                    "ingested_at": datetime.now().isoformat()
+                }]
+            )
+            ingested += 1
+
+        return ingested
+
+    def ingest_cognitive_fingerprint(self, fingerprint_path: str) -> bool:
+        """
+        Ingest the master cognitive fingerprint.
+
+        This is the single most important document in the Ur-Codex—
+        it defines who Michael is for voice replication and
+        Russellian calibration.
+        """
+        path = Path(fingerprint_path)
+        if not path.exists():
+            return False
+
+        with open(path, 'r') as f:
+            content = f.read()
+
+        doc_id = self._generate_doc_id(content, str(path))
+
+        # Maximum importance
+        self.collection.upsert(
+            ids=[doc_id],
+            documents=[content],
+            metadatas=[{
+                "source_file": str(path),
+                "doc_type": "cognitive_fingerprint",
+                "title": "MICHAEL_COGNITIVE_FINGERPRINT",
+                "importance_score": 10.0,
+                "ingested_at": datetime.now().isoformat()
+            }]
         )
-        self._collection = self._client.get_or_create_collection(
-            name=self.COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
 
-    def ingest(self, entry: CodexEntry) -> str:
-        """Add a single entry to the Ur-Codex."""
-        chunks = self._chunk(entry.content)
-        ids, documents, metadatas = [], [], []
+        return True
 
-        for i, chunk in enumerate(chunks):
-            chunk_id = f"{entry.entry_id}_{i}"
-            ids.append(chunk_id)
-            documents.append(chunk)
-            metadatas.append({
-                "entry_id": entry.entry_id,
-                "source": entry.source,
-                "timestamp": entry.timestamp.isoformat(),
-                "chunk_index": i,
-                "chunk_count": len(chunks),
-                "content_hash": entry.content_hash(),
-                **entry.metadata,
-            })
+    def ingest_creative_corpus(self, creative_dir: str) -> int:
+        """
+        Ingest creative writing samples.
 
-        self._collection.add(ids=ids, documents=documents, metadatas=metadatas)
-        return entry.entry_id
+        Creative work reveals voice, concerns, and authentic expression.
+        Generally high importance for voice calibration.
+        """
+        creative_path = Path(creative_dir)
+        if not creative_path.exists():
+            return 0
 
-    def ingest_many(self, entries: list[CodexEntry]) -> list[str]:
-        return [self.ingest(e) for e in entries]
+        ingested = 0
+        for creative_file in creative_path.glob("**/*.md"):
+            with open(creative_file, 'r') as f:
+                content = f.read()
 
-    def retrieve(
-        self,
-        query: str,
-        n_results: int = 5,
-        where: dict | None = None,
-    ) -> list[RetrievalResult]:
-        """Retrieve relevant entries by semantic similarity."""
-        kwargs: dict[str, Any] = {
-            "query_texts": [query],
-            "n_results": min(n_results, self._collection.count() or 1),
+            title = creative_file.stem
+            doc_id = self._generate_doc_id(content, str(creative_file))
+
+            # Creative work is important for voice calibration
+            importance = 7.0
+
+            self.collection.upsert(
+                ids=[doc_id],
+                documents=[content],
+                metadatas=[{
+                    "source_file": str(creative_file),
+                    "doc_type": "creative",
+                    "title": title,
+                    "importance_score": importance,
+                    "ingested_at": datetime.now().isoformat()
+                }]
+            )
+            ingested += 1
+
+        return ingested
+
+    def ingest_complete_corpus(self, corpus_root: str) -> Dict[str, int]:
+        """
+        Ingest the entire Complete Corpus.
+
+        This is the full Ur-Codex ingestion that loads all document types
+        with appropriate importance scoring.
+        """
+        corpus_path = Path(corpus_root)
+        results = {
+            "transfer_packets": 0,
+            "psychological": 0,
+            "creative": 0,
+            "fingerprint": False
         }
-        if where:
-            kwargs["where"] = where
 
-        results = self._collection.query(**kwargs)
+        # Transfer packets
+        packets_dir = corpus_path / "parsed_transfer_packets"
+        if packets_dir.exists():
+            results["transfer_packets"] = self.ingest_transfer_packets(str(packets_dir))
 
-        output = []
-        for i, doc in enumerate(results["documents"][0]):
-            meta = results["metadatas"][0][i]
-            output.append(RetrievalResult(
-                entry_id=meta.get("entry_id", ""),
-                content=doc,
-                source=meta.get("source", ""),
-                distance=results["distances"][0][i],
-                metadata=meta,
-            ))
-        return output
+        # Psychological assessments
+        psych_dir = corpus_path / "parsed_psychological_assessments"
+        if psych_dir.exists():
+            results["psychological"] = self.ingest_psychological_profiles(str(psych_dir))
 
-    def count(self) -> int:
-        return self._collection.count()
+        # Creative writing
+        creative_dir = corpus_path / "parsed_creative_writing"
+        if creative_dir.exists():
+            results["creative"] = self.ingest_creative_corpus(str(creative_dir))
 
-    def _chunk(
+        # Cognitive fingerprint
+        fingerprint_path = corpus_path / "MICHAEL_COGNITIVE_FINGERPRINT.md"
+        if fingerprint_path.exists():
+            results["fingerprint"] = self.ingest_cognitive_fingerprint(str(fingerprint_path))
+
+        # Also ingest the training guide and validation docs
+        for doc_name in ["DOLPHIN_TRAINING_GUIDE.md", "VOICE_VALIDATION.md"]:
+            doc_path = corpus_path / doc_name
+            if doc_path.exists():
+                with open(doc_path, 'r') as f:
+                    content = f.read()
+
+                doc_id = self._generate_doc_id(content, str(doc_path))
+                self.collection.upsert(
+                    ids=[doc_id],
+                    documents=[content],
+                    metadatas=[{
+                        "source_file": str(doc_path),
+                        "doc_type": "voice_calibration",
+                        "title": doc_name.replace('.md', ''),
+                        "importance_score": 9.0,
+                        "ingested_at": datetime.now().isoformat()
+                    }]
+                )
+
+        return results
+
+    def query(
         self,
-        text: str,
-        size: int = DEFAULT_CHUNK_SIZE,
-        overlap: int = DEFAULT_CHUNK_OVERLAP,
-    ) -> list[str]:
-        if len(text) <= size:
-            return [text]
-        chunks, start = [], 0
-        while start < len(text):
-            end = min(start + size, len(text))
-            chunks.append(text[start:end])
-            start += size - overlap
-        return chunks
+        query_text: str,
+        n_results: int = 20,
+        doc_types: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """
+        Query the Ur-Codex for relevant documents.
+
+        Returns documents with similarity scores and metadata
+        for Sophimatic weighting.
+        """
+        where_filter = None
+        if doc_types:
+            where_filter = {"doc_type": {"$in": doc_types}}
+
+        results = self.collection.query(
+            query_texts=[query_text],
+            n_results=n_results,
+            where=where_filter,
+            include=["documents", "metadatas", "distances"]
+        )
+
+        documents = []
+        if results['documents'] and results['documents'][0]:
+            for i, doc in enumerate(results['documents'][0]):
+                metadata = results['metadatas'][0][i] if results['metadatas'] else {}
+                distance = results['distances'][0][i] if results['distances'] else 0.5
+
+                # Convert distance to similarity (cosine distance -> similarity)
+                similarity = 1 - distance
+
+                documents.append({
+                    'content': doc,
+                    'id': results['ids'][0][i] if results['ids'] else str(i),
+                    'metadata': metadata,
+                    'similarity': similarity
+                })
+
+        return documents
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics about the Ur-Codex."""
+        count = self.collection.count()
+
+        # Sample to get doc type distribution
+        sample = self.collection.peek(limit=min(100, count))
+
+        doc_types = {}
+        if sample['metadatas']:
+            for meta in sample['metadatas']:
+                doc_type = meta.get('doc_type', 'unknown')
+                doc_types[doc_type] = doc_types.get(doc_type, 0) + 1
+
+        return {
+            "total_documents": count,
+            "doc_type_distribution": doc_types,
+            "importance_index_size": len(self._importance_index)
+        }
+
+    def add_conversation(
+        self,
+        content: str,
+        importance_score: float = 5.0,
+        metadata: Optional[Dict] = None
+    ) -> str:
+        """
+        Add a new conversation exchange to the Ur-Codex.
+
+        This allows the corpus to grow over time as new
+        significant exchanges occur.
+        """
+        doc_id = self._generate_doc_id(content, f"conversation:{datetime.now().isoformat()}")
+
+        doc_metadata = {
+            "source_file": "live_conversation",
+            "doc_type": "conversation",
+            "title": f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            "importance_score": importance_score,
+            "ingested_at": datetime.now().isoformat()
+        }
+
+        if metadata:
+            doc_metadata.update(metadata)
+
+        self.collection.upsert(
+            ids=[doc_id],
+            documents=[content],
+            metadatas=[doc_metadata]
+        )
+
+        return doc_id
