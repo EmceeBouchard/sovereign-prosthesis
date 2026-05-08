@@ -25,23 +25,39 @@ from dataclasses import dataclass, field
 import chromadb
 
 
-# Importance scoring criteria for auto-classification
-IMPORTANCE_CRITERIA = """
-Score documents on a 1-10 scale based on these criteria:
+# Significance scoring criteria for auto-classification
+SIGNIFICANCE_CRITERIA = """You are scoring a document for the Sophimatics corpus.
+Assign an importance_score from 1-10 using these criteria:
 
-10 = Foundational philosophy (establishes axioms, core beliefs, worldview foundations)
-9  = Core identity (defines who the user is, psychological profiles, cognitive fingerprints)
-8  = Active project architecture (load-bearing decisions, system designs, critical implementations)
-7  = Completed significant work (finished projects, published writing, substantial creative output)
-6  = Creative work (drafts, experiments, artistic expression, works in progress)
-5  = Default (conversations, operational notes, meeting summaries, general documentation)
-4  = Reference material (lookup tables, external quotes, bookmarks)
-3  = Logistics (schedules, reminders, task lists)
-2  = Ephemera (casual messages, temporary notes)
-1  = Low signal (automated logs, boilerplate, noise)
+10 — Foundational philosophy. Establishes axioms that all
+     other reasoning depends on. Example: a document defining
+     the user's core worldview or ethical commitments.
 
-Respond with ONLY a single number from 1-10. No explanation.
-"""
+9  — Core identity. Defines who the user is, how they think,
+     what they value. Example: cognitive fingerprint,
+     self-description, identity entity page.
+
+8  — Active project architecture. Load-bearing decisions for
+     something currently being built. Example: architectural
+     decisions, design principles for ongoing work.
+
+7  — Completed significant work. Finished creative or
+     intellectual work with lasting relevance. Example:
+     published papers, completed plays, finished essays.
+
+6  — Active creative work. Work in progress with ongoing
+     relevance. Example: drafts, working documents.
+
+5  — Default. Conversations, notes, operational content
+     without special significance.
+
+1-4 — Low signal. Logistics, ephemera, one-off references
+      with no lasting relevance.
+
+Document to score:
+{document_text}
+
+Return only a single integer between 1 and 10."""
 
 
 def auto_classify_significance(
@@ -54,7 +70,7 @@ def auto_classify_significance(
     Use local Ollama LLM to auto-classify document importance.
 
     Reads the document text and asks the model to score it based on
-    the IMPORTANCE_CRITERIA constant.
+    the SIGNIFICANCE_CRITERIA constant.
 
     Args:
         document_text: The full text of the document to classify
@@ -71,14 +87,7 @@ def auto_classify_significance(
     if len(document_text) > max_chars:
         text_sample += "\n\n[... document truncated for classification ...]"
 
-    prompt = f"""{IMPORTANCE_CRITERIA}
-
-Document to classify:
----
-{text_sample}
----
-
-Importance score (1-10):"""
+    prompt = SIGNIFICANCE_CRITERIA.format(document_text=text_sample)
 
     try:
         response = requests.post(
