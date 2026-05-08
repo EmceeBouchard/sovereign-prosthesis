@@ -17,11 +17,102 @@ This module handles:
 import os
 import json
 import hashlib
+import requests
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
 import chromadb
+
+
+# Importance scoring criteria for auto-classification
+IMPORTANCE_CRITERIA = """
+Score documents on a 1-10 scale based on these criteria:
+
+10 = Foundational philosophy (establishes axioms, core beliefs, worldview foundations)
+9  = Core identity (defines who the user is, psychological profiles, cognitive fingerprints)
+8  = Active project architecture (load-bearing decisions, system designs, critical implementations)
+7  = Completed significant work (finished projects, published writing, substantial creative output)
+6  = Creative work (drafts, experiments, artistic expression, works in progress)
+5  = Default (conversations, operational notes, meeting summaries, general documentation)
+4  = Reference material (lookup tables, external quotes, bookmarks)
+3  = Logistics (schedules, reminders, task lists)
+2  = Ephemera (casual messages, temporary notes)
+1  = Low signal (automated logs, boilerplate, noise)
+
+Respond with ONLY a single number from 1-10. No explanation.
+"""
+
+
+def auto_classify_significance(
+    document_text: str,
+    ollama_host: str = "http://localhost:11434",
+    model: str = "llama3.2",
+    timeout: float = 30.0
+) -> float:
+    """
+    Use local Ollama LLM to auto-classify document importance.
+
+    Reads the document text and asks the model to score it based on
+    the IMPORTANCE_CRITERIA constant.
+
+    Args:
+        document_text: The full text of the document to classify
+        ollama_host: Ollama API endpoint
+        model: Model name to use for classification
+        timeout: Request timeout in seconds
+
+    Returns:
+        importance_score: Float from 1.0-10.0, defaults to 5.0 on failure
+    """
+    # Truncate very long documents to avoid token limits
+    max_chars = 4000
+    text_sample = document_text[:max_chars]
+    if len(document_text) > max_chars:
+        text_sample += "\n\n[... document truncated for classification ...]"
+
+    prompt = f"""{IMPORTANCE_CRITERIA}
+
+Document to classify:
+---
+{text_sample}
+---
+
+Importance score (1-10):"""
+
+    try:
+        response = requests.post(
+            f"{ollama_host}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,  # Low temperature for consistent scoring
+                    "num_predict": 10    # Only need a single number
+                }
+            },
+            timeout=timeout
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        answer = result.get("response", "").strip()
+
+        # Parse the score - extract first number found
+        import re
+        match = re.search(r'\b(10|[1-9])\b', answer)
+        if match:
+            return float(match.group(1))
+
+        # Fallback to default
+        return 5.0
+
+    except requests.exceptions.RequestException:
+        # Ollama not available or request failed - return default
+        return 5.0
+    except (ValueError, KeyError):
+        return 5.0
 
 
 @dataclass
@@ -55,11 +146,17 @@ class UrCodexManager:
         self,
         persist_directory: str = "./chroma_db",
         collection_name: str = "ur_codex",
-        corpus_path: Optional[str] = None
+        corpus_path: Optional[str] = None,
+        ollama_host: str = "http://localhost:11434",
+        ollama_model: str = "llama3.2",
+        auto_classify: bool = True
     ):
         self.persist_directory = persist_directory
         self.collection_name = collection_name
         self.corpus_path = corpus_path
+        self.ollama_host = ollama_host
+        self.ollama_model = ollama_model
+        self.auto_classify = auto_classify
 
         # Initialize ChromaDB
         self.client = chromadb.PersistentClient(path=persist_directory)
@@ -72,6 +169,32 @@ class UrCodexManager:
 
         # Cache for importance index
         self._importance_index: Dict[str, float] = {}
+
+    def _get_importance_score(
+        self,
+        content: str,
+        explicit_score: Optional[float] = None,
+        default_score: float = 5.0
+    ) -> float:
+        """
+        Get importance score for a document.
+
+        Priority:
+        1. Explicit score if provided (manual override)
+        2. Auto-classification via Ollama if enabled
+        3. Default score as fallback
+        """
+        if explicit_score is not None:
+            return explicit_score
+
+        if self.auto_classify:
+            return auto_classify_significance(
+                content,
+                ollama_host=self.ollama_host,
+                model=self.ollama_model
+            )
+
+        return default_score
 
     def _generate_doc_id(self, content: str, source: str) -> str:
         """Generate stable document ID from content hash."""
@@ -404,7 +527,7 @@ class UrCodexManager:
     def add_conversation(
         self,
         content: str,
-        importance_score: float = 5.0,
+        importance_score: Optional[float] = None,
         metadata: Optional[Dict] = None
     ) -> str:
         """
@@ -412,14 +535,82 @@ class UrCodexManager:
 
         This allows the corpus to grow over time as new
         significant exchanges occur.
+
+        Args:
+            content: The conversation text to add
+            importance_score: Explicit score (1-10). If None, auto-classifies.
+            metadata: Additional metadata to attach
+
+        Returns:
+            doc_id: The generated document ID
         """
         doc_id = self._generate_doc_id(content, f"conversation:{datetime.now().isoformat()}")
+
+        # Auto-classify if no explicit score provided
+        score = self._get_importance_score(content, importance_score, default_score=5.0)
 
         doc_metadata = {
             "source_file": "live_conversation",
             "doc_type": "conversation",
             "title": f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "importance_score": importance_score,
+            "importance_score": score,
+            "auto_classified": importance_score is None,
+            "ingested_at": datetime.now().isoformat()
+        }
+
+        if metadata:
+            doc_metadata.update(metadata)
+
+        self.collection.upsert(
+            ids=[doc_id],
+            documents=[content],
+            metadatas=[doc_metadata]
+        )
+
+        return doc_id
+
+    def ingest_document(
+        self,
+        content: str,
+        source_file: str,
+        doc_type: str = "document",
+        title: Optional[str] = None,
+        importance_score: Optional[float] = None,
+        metadata: Optional[Dict] = None
+    ) -> str:
+        """
+        Ingest a single document with auto-classification support.
+
+        This is the primary method for adding new documents to the Ur-Codex.
+        If importance_score is not provided, the document will be automatically
+        classified using the local Ollama LLM.
+
+        Args:
+            content: The document text
+            source_file: Path or identifier for the source
+            doc_type: Document type (e.g., 'creative', 'reference', 'conversation')
+            title: Optional title (derived from source_file if not provided)
+            importance_score: Explicit score (1-10). If None, auto-classifies.
+            metadata: Additional metadata to attach
+
+        Returns:
+            doc_id: The generated document ID
+        """
+        doc_id = self._generate_doc_id(content, source_file)
+
+        # Auto-classify if no explicit score provided
+        score = self._get_importance_score(content, importance_score, default_score=5.0)
+
+        # Derive title from source file if not provided
+        if title is None:
+            title = Path(source_file).stem if source_file else "Untitled"
+
+        doc_metadata = {
+            "source_file": source_file,
+            "doc_type": doc_type,
+            "title": title,
+            "importance_score": score,
+            "auto_classified": importance_score is None,
             "ingested_at": datetime.now().isoformat()
         }
 
