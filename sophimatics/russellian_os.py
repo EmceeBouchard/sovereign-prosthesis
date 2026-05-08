@@ -13,7 +13,7 @@ This module implements:
 4. The balance between support and productive challenge
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 from enum import Enum
 
@@ -313,3 +313,188 @@ class RussellianOS:
             return False
 
         return True
+
+    def evaluate(
+        self,
+        assembled_context: Dict
+    ) -> Optional[DissentSignal]:
+        """
+        Evaluate assembled context for dissent opportunities.
+
+        This is the primary entry point for post-retrieval Russellian analysis.
+        Unlike detect_dissent_opportunity (which only sees raw input), this
+        method can detect contradictions between current input and historical
+        decisions in the retrieved corpus.
+
+        Args:
+            assembled_context: Dict containing:
+                - user_input: str - The current user message
+                - retrieved_docs: List[Dict] - Documents from Ur-Codex retrieval
+                - state: str - Formatted state awareness context
+
+        Returns:
+            DissentSignal if dissent is warranted, None otherwise
+        """
+        user_input = assembled_context.get("user_input", "")
+        retrieved_docs = assembled_context.get("retrieved_docs", [])
+        state_context = assembled_context.get("state", "")
+
+        # First, check for basic dissent triggers in user input
+        basic_signal = self.detect_dissent_opportunity(user_input)
+
+        # Then, check for contradictions with historical context
+        contradiction_signal = self._detect_historical_contradiction(
+            user_input, retrieved_docs
+        )
+
+        # Then, check for state inconsistencies
+        state_signal = self._detect_state_inconsistency(
+            user_input, state_context
+        )
+
+        # Return the strongest signal
+        signals = [s for s in [contradiction_signal, state_signal, basic_signal] if s]
+        if not signals:
+            return None
+
+        # Sort by dissent level (highest first)
+        signals.sort(key=lambda s: s.level.value, reverse=True)
+        return signals[0]
+
+    def _detect_historical_contradiction(
+        self,
+        user_input: str,
+        retrieved_docs: List[Dict]
+    ) -> Optional[DissentSignal]:
+        """
+        Detect contradictions between current input and historical decisions.
+
+        Looks for cases where the user is proposing something that conflicts
+        with documented prior decisions, stated values, or completed work.
+        """
+        if not retrieved_docs:
+            return None
+
+        user_lower = user_input.lower()
+
+        # Contradiction indicators in user input
+        reversal_phrases = [
+            "let's abandon", "forget about", "scrap the",
+            "never mind", "changed my mind", "actually let's not",
+            "i don't think we should", "maybe we shouldn't"
+        ]
+
+        # Check if user is proposing a reversal
+        is_reversal = any(phrase in user_lower for phrase in reversal_phrases)
+
+        if is_reversal:
+            # Look for high-importance docs that might be affected
+            for doc in retrieved_docs:
+                importance = doc.get("importance", doc.get("metadata", {}).get("importance_score", 5))
+                if importance >= 7:
+                    doc_content = doc.get("content", "")[:500].lower()
+                    # Check for topic overlap
+                    user_words = set(user_lower.split())
+                    doc_words = set(doc_content.split())
+                    overlap = len(user_words & doc_words)
+
+                    if overlap >= 3:
+                        return DissentSignal(
+                            level=DissentLevel.MODERATE,
+                            trigger="Potential reversal of documented decision",
+                            reasoning=f"This appears to contradict a prior decision (importance: {importance}/10). Worth examining whether circumstances have changed.",
+                            suggested_response="Before reversing course, let's review what led to the original decision."
+                        )
+
+        # Check for contradictions with foundational docs (importance >= 9)
+        for doc in retrieved_docs:
+            importance = doc.get("importance", doc.get("metadata", {}).get("importance_score", 5))
+            if importance >= 9:
+                doc_content = doc.get("content", "")[:1000].lower()
+
+                # Look for value contradictions
+                if self._check_value_conflict(user_lower, doc_content):
+                    return DissentSignal(
+                        level=DissentLevel.STRONG,
+                        trigger="Potential conflict with foundational values",
+                        reasoning="This may conflict with documented core values or identity commitments.",
+                        suggested_response="This touches on foundational commitments—worth examining the alignment."
+                    )
+
+        return None
+
+    def _check_value_conflict(self, user_input: str, foundational_doc: str) -> bool:
+        """
+        Check if user input conflicts with values in foundational document.
+
+        Simple heuristic: look for negation patterns near value-laden terms.
+        """
+        # Value-laden terms that might appear in foundational docs
+        value_terms = [
+            "integrity", "honesty", "rigor", "intellectual",
+            "constraint", "discipline", "commitment", "principle",
+            "authentic", "genuine", "direct", "truth"
+        ]
+
+        # Negation patterns
+        negation_patterns = [
+            "don't care about", "doesn't matter", "forget",
+            "ignore", "skip", "bypass", "who cares about"
+        ]
+
+        # Check if user is negating a value present in foundational doc
+        for value in value_terms:
+            if value in foundational_doc:
+                for negation in negation_patterns:
+                    if negation in user_input and value in user_input:
+                        return True
+
+        return False
+
+    def _detect_state_inconsistency(
+        self,
+        user_input: str,
+        state_context: str
+    ) -> Optional[DissentSignal]:
+        """
+        Detect inconsistencies between user input and tracked state.
+
+        Catches cases where user proposes something that conflicts with
+        active projects, open concerns, or tracked commitments.
+        """
+        if not state_context or "[PERSISTENT STATE AWARENESS]" not in state_context:
+            return None
+
+        user_lower = user_input.lower()
+
+        # Check for project abandonment without acknowledgment
+        if "Active Projects:" in state_context:
+            abandonment_phrases = [
+                "start fresh", "new direction", "forget the",
+                "abandon", "drop the", "give up on"
+            ]
+
+            if any(phrase in user_lower for phrase in abandonment_phrases):
+                return DissentSignal(
+                    level=DissentLevel.MILD,
+                    trigger="Potential unacknowledged project shift",
+                    reasoning="There are active projects in tracked state. If shifting focus, worth explicitly closing or pausing them.",
+                    suggested_response="Before starting fresh, should we update the status of current projects?"
+                )
+
+        # Check for ignoring tracked concerns
+        if "Recurring Concerns:" in state_context:
+            dismissal_phrases = [
+                "not worried about", "doesn't matter", "forget about",
+                "stop thinking about", "move past"
+            ]
+
+            if any(phrase in user_lower for phrase in dismissal_phrases):
+                return DissentSignal(
+                    level=DissentLevel.MILD,
+                    trigger="Potential dismissal of tracked concern",
+                    reasoning="This may relate to a recurring concern that's been flagged multiple times.",
+                    suggested_response="This touches on a recurring concern—is it resolved, or being set aside?"
+                )
+
+        return None
