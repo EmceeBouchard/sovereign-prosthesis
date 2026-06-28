@@ -17,11 +17,112 @@ This module handles:
 import os
 import json
 import hashlib
+import requests
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
 import chromadb
+from chromadb.config import Settings
+
+
+# Significance scoring criteria for auto-classification
+SIGNIFICANCE_CRITERIA = """You are scoring a document for the Sophimatics corpus.
+Assign an importance_score from 1-10 using these criteria:
+
+10 — Foundational philosophy. Establishes axioms that all
+     other reasoning depends on. Example: a document defining
+     the user's core worldview or ethical commitments.
+
+9  — Core identity. Defines who the user is, how they think,
+     what they value. Example: cognitive fingerprint,
+     self-description, identity entity page.
+
+8  — Active project architecture. Load-bearing decisions for
+     something currently being built. Example: architectural
+     decisions, design principles for ongoing work.
+
+7  — Completed significant work. Finished creative or
+     intellectual work with lasting relevance. Example:
+     published papers, completed plays, finished essays.
+
+6  — Active creative work. Work in progress with ongoing
+     relevance. Example: drafts, working documents.
+
+5  — Default. Conversations, notes, operational content
+     without special significance.
+
+1-4 — Low signal. Logistics, ephemera, one-off references
+      with no lasting relevance.
+
+Document to score:
+{document_text}
+
+Return only a single integer between 1 and 10."""
+
+
+def auto_classify_significance(
+    document_text: str,
+    ollama_host: str = "http://localhost:11434",
+    model: str = "llama3.2",
+    timeout: float = 30.0
+) -> float:
+    """
+    Use local Ollama LLM to auto-classify document importance.
+
+    Reads the document text and asks the model to score it based on
+    the SIGNIFICANCE_CRITERIA constant.
+
+    Args:
+        document_text: The full text of the document to classify
+        ollama_host: Ollama API endpoint
+        model: Model name to use for classification
+        timeout: Request timeout in seconds
+
+    Returns:
+        importance_score: Float from 1.0-10.0, defaults to 5.0 on failure
+    """
+    # Truncate very long documents to avoid token limits
+    max_chars = 4000
+    text_sample = document_text[:max_chars]
+    if len(document_text) > max_chars:
+        text_sample += "\n\n[... document truncated for classification ...]"
+
+    prompt = SIGNIFICANCE_CRITERIA.format(document_text=text_sample)
+
+    try:
+        response = requests.post(
+            f"{ollama_host}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.1,  # Low temperature for consistent scoring
+                    "num_predict": 10    # Only need a single number
+                }
+            },
+            timeout=timeout
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        answer = result.get("response", "").strip()
+
+        # Parse the score - extract first number found
+        import re
+        match = re.search(r'\b(10|[1-9])\b', answer)
+        if match:
+            return float(match.group(1))
+
+        # Fallback to default
+        return 5.0
+
+    except requests.exceptions.RequestException:
+        # Ollama not available or request failed - return default
+        return 5.0
+    except (ValueError, KeyError):
+        return 5.0
 
 
 @dataclass
@@ -55,14 +156,23 @@ class UrCodexManager:
         self,
         persist_directory: str = "./chroma_db",
         collection_name: str = "ur_codex",
-        corpus_path: Optional[str] = None
+        corpus_path: Optional[str] = None,
+        ollama_host: str = "http://localhost:11434",
+        ollama_model: str = "llama3.2",
+        auto_classify: bool = True
     ):
         self.persist_directory = persist_directory
         self.collection_name = collection_name
         self.corpus_path = corpus_path
+        self.ollama_host = ollama_host
+        self.ollama_model = ollama_model
+        self.auto_classify = auto_classify
 
-        # Initialize ChromaDB
-        self.client = chromadb.PersistentClient(path=persist_directory)
+        # Initialize ChromaDB with telemetry disabled to prevent posthog version conflicts
+        self.client = chromadb.PersistentClient(
+            path=persist_directory,
+            settings=Settings(anonymized_telemetry=False)
+        )
 
         # Get or create collection (uses default embedding function)
         self.collection = self.client.get_or_create_collection(
@@ -72,6 +182,32 @@ class UrCodexManager:
 
         # Cache for importance index
         self._importance_index: Dict[str, float] = {}
+
+    def _get_importance_score(
+        self,
+        content: str,
+        explicit_score: Optional[float] = None,
+        default_score: float = 5.0
+    ) -> float:
+        """
+        Get importance score for a document.
+
+        Priority:
+        1. Explicit score if provided (manual override)
+        2. Auto-classification via Ollama if enabled
+        3. Default score as fallback
+        """
+        if explicit_score is not None:
+            return explicit_score
+
+        if self.auto_classify:
+            return auto_classify_significance(
+                content,
+                ollama_host=self.ollama_host,
+                model=self.ollama_model
+            )
+
+        return default_score
 
     def _generate_doc_id(self, content: str, source: str) -> str:
         """Generate stable document ID from content hash."""
@@ -284,6 +420,111 @@ class UrCodexManager:
 
         return ingested
 
+    def ingest_conversations(self, conversations_dir: str, chunk_size: int = 2000) -> int:
+        """
+        Ingest conversation archive from parsed OpenAI conversations.
+
+        These are the 290K+ lines of conversational data that form the
+        behavioral corpus for understanding Michael's communication patterns.
+
+        Large conversations are chunked to fit embedding limits while
+        preserving context through overlap.
+        """
+        conv_path = Path(conversations_dir)
+        if not conv_path.exists():
+            return 0
+
+        ingested = 0
+
+        for conv_file in conv_path.glob("*.md"):
+            try:
+                with open(conv_file, 'r') as f:
+                    content = f.read()
+
+                # Parse YAML frontmatter for metadata
+                metadata = {
+                    "source_file": str(conv_file),
+                    "doc_type": "conversation",
+                    "importance_score": 6.0,  # Conversations are contextually important
+                    "ingested_at": datetime.now().isoformat()
+                }
+
+                # Extract metadata from frontmatter if present
+                if content.startswith('---'):
+                    parts = content.split('---', 2)
+                    if len(parts) >= 3:
+                        frontmatter = parts[1]
+                        content_body = parts[2]
+
+                        # Extract key fields from frontmatter
+                        for line in frontmatter.split('\n'):
+                            if line.startswith('conversation_id:'):
+                                metadata['conversation_id'] = line.split(':', 1)[1].strip()
+                            elif line.startswith('primary_topics:'):
+                                metadata['topics'] = line.split(':', 1)[1].strip()
+                            elif line.startswith('conversation_type:'):
+                                metadata['conversation_type'] = line.split(':', 1)[1].strip()
+                            elif line.startswith('michael_voice_strength:'):
+                                strength = line.split(':', 1)[1].strip().lower()
+                                # Boost importance for high voice strength
+                                if strength == 'high':
+                                    metadata['importance_score'] = 7.0
+                                elif strength == 'very_high':
+                                    metadata['importance_score'] = 8.0
+
+                        content = content_body
+
+                # Chunk large conversations
+                if len(content) > chunk_size:
+                    chunks = []
+                    words = content.split()
+                    current_chunk = []
+                    current_size = 0
+
+                    for word in words:
+                        current_chunk.append(word)
+                        current_size += len(word) + 1
+                        if current_size >= chunk_size:
+                            chunks.append(' '.join(current_chunk))
+                            # Keep last 50 words for overlap
+                            current_chunk = current_chunk[-50:]
+                            current_size = sum(len(w) + 1 for w in current_chunk)
+
+                    if current_chunk:
+                        chunks.append(' '.join(current_chunk))
+
+                    # Ingest each chunk
+                    for i, chunk in enumerate(chunks):
+                        chunk_id = self._generate_doc_id(chunk, f"{conv_file}_chunk_{i}")
+                        chunk_metadata = metadata.copy()
+                        chunk_metadata['chunk_index'] = i
+                        chunk_metadata['total_chunks'] = len(chunks)
+
+                        self.collection.upsert(
+                            ids=[chunk_id],
+                            documents=[chunk],
+                            metadatas=[chunk_metadata]
+                        )
+                else:
+                    doc_id = self._generate_doc_id(content, str(conv_file))
+                    self.collection.upsert(
+                        ids=[doc_id],
+                        documents=[content],
+                        metadatas=[metadata]
+                    )
+
+                ingested += 1
+
+                # Log progress every 100 conversations
+                if ingested % 100 == 0:
+                    print(f"Ingested {ingested} conversations...")
+
+            except Exception as e:
+                print(f"Error ingesting conversation {conv_file}: {e}")
+                continue
+
+        return ingested
+
     def ingest_complete_corpus(self, corpus_root: str) -> Dict[str, int]:
         """
         Ingest the entire Complete Corpus.
@@ -296,6 +537,7 @@ class UrCodexManager:
             "transfer_packets": 0,
             "psychological": 0,
             "creative": 0,
+            "conversations": 0,
             "fingerprint": False
         }
 
@@ -313,6 +555,12 @@ class UrCodexManager:
         creative_dir = corpus_path / "parsed_creative_writing"
         if creative_dir.exists():
             results["creative"] = self.ingest_creative_corpus(str(creative_dir))
+
+        # Conversation archive (290K+ lines of behavioral data)
+        conversations_dir = corpus_path / "parsed_openai_archive" / "conversations"
+        if conversations_dir.exists():
+            print("Ingesting conversation archive (this may take a while)...")
+            results["conversations"] = self.ingest_conversations(str(conversations_dir))
 
         # Cognitive fingerprint
         fingerprint_path = corpus_path / "MICHAEL_COGNITIVE_FINGERPRINT.md"
@@ -387,13 +635,18 @@ class UrCodexManager:
         count = self.collection.count()
 
         # Sample to get doc type distribution
-        sample = self.collection.peek(limit=min(100, count))
-
+        # Use try-except to handle ChromaDB version compatibility issues with peek()
         doc_types = {}
-        if sample['metadatas']:
-            for meta in sample['metadatas']:
-                doc_type = meta.get('doc_type', 'unknown')
-                doc_types[doc_type] = doc_types.get(doc_type, 0) + 1
+        try:
+            sample = self.collection.peek(limit=min(100, count))
+            if sample['metadatas']:
+                for meta in sample['metadatas']:
+                    doc_type = meta.get('doc_type', 'unknown')
+                    doc_types[doc_type] = doc_types.get(doc_type, 0) + 1
+        except (AttributeError, KeyError, Exception) as e:
+            # ChromaDB version mismatch - peek() fails on old data format
+            # Fall back to just returning count without distribution
+            doc_types = {"note": f"distribution unavailable ({type(e).__name__})"}
 
         return {
             "total_documents": count,
@@ -404,7 +657,7 @@ class UrCodexManager:
     def add_conversation(
         self,
         content: str,
-        importance_score: float = 5.0,
+        importance_score: Optional[float] = None,
         metadata: Optional[Dict] = None
     ) -> str:
         """
@@ -412,14 +665,26 @@ class UrCodexManager:
 
         This allows the corpus to grow over time as new
         significant exchanges occur.
+
+        Args:
+            content: The conversation text to add
+            importance_score: Explicit score (1-10). If None, auto-classifies.
+            metadata: Additional metadata to attach
+
+        Returns:
+            doc_id: The generated document ID
         """
         doc_id = self._generate_doc_id(content, f"conversation:{datetime.now().isoformat()}")
+
+        # Auto-classify if no explicit score provided
+        score = self._get_importance_score(content, importance_score, default_score=5.0)
 
         doc_metadata = {
             "source_file": "live_conversation",
             "doc_type": "conversation",
             "title": f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-            "importance_score": importance_score,
+            "importance_score": score,
+            "auto_classified": importance_score is None,
             "ingested_at": datetime.now().isoformat()
         }
 

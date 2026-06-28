@@ -284,6 +284,50 @@ class ProvenanceTracker:
         return options[0]
 
 
+def is_conversational_response(response: str) -> bool:
+    """
+    Detect if a response is a simple conversational exchange that
+    doesn't require provenance hedging.
+
+    Greetings, acknowledgments, and simple questions don't make
+    epistemic claims and shouldn't be tagged as "speculation."
+    """
+    response_lower = response.lower().strip()
+
+    # Common greeting/conversational patterns
+    conversational_patterns = [
+        # Greetings
+        "hello", "hi ", "hi!", "hey", "good morning", "good afternoon",
+        "good evening", "howdy", "greetings",
+        # Acknowledgments
+        "sure", "okay", "of course", "absolutely", "certainly", "no problem",
+        "you're welcome", "happy to help", "glad to help",
+        # Questions back to user
+        "how can i help", "what can i do", "what would you like",
+        "how may i assist", "what do you need",
+        # Simple responses
+        "thank you", "thanks", "got it", "understood", "i see",
+    ]
+
+    # Check if response starts with or is a conversational pattern
+    for pattern in conversational_patterns:
+        if response_lower.startswith(pattern) or response_lower == pattern:
+            return True
+
+    # Very short responses (under 50 chars) that end with ? are likely questions
+    if len(response) < 50 and response.strip().endswith("?"):
+        return True
+
+    # Very short responses without substantive claims
+    if len(response) < 100 and not any(word in response_lower for word in [
+        "because", "therefore", "indicates", "suggests", "evidence",
+        "according to", "based on", "research", "studies show"
+    ]):
+        return True
+
+    return False
+
+
 def create_transparent_response(
     base_response: str,
     retrieved_docs: List[Dict],
@@ -297,7 +341,14 @@ def create_transparent_response(
     1. Classifying retrieval quality
     2. Tagging the response
     3. Optionally adding provenance footer
+
+    Note: Simple conversational exchanges (greetings, acknowledgments)
+    are exempt from hedging—they don't make epistemic claims.
     """
+    # Skip provenance hedging for conversational responses
+    if is_conversational_response(base_response):
+        return base_response
+
     # Tag the overall response
     tag = tracker.tag_claim(base_response[:200], retrieved_docs)
 
